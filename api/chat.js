@@ -392,7 +392,7 @@ function normPhone(v) { const d = String(v || "").replace(/\D/g, ""); return d.l
 
 async function findOrderByNumber(orderId) {
   const digits = String(orderId).replace(/[^0-9]/g, "");
-  const candidates = [digits, `LM${digits}`, `#LM${digits}`, `#${digits}`, String(orderId)];
+  const candidates = [digits, `TRZ${digits}`, `#TRZ${digits}`, `#${digits}`, String(orderId)];
   for (const name of candidates) {
     if (!name) continue;
     try {
