@@ -407,6 +407,26 @@ async function findOrderByNumber(orderId) {
   return { order: null };
 }
 
+async function findOrderByTracking(trackingNumber) {
+  const t = String(trackingNumber || "").replace(/\s/g, "").toLowerCase();
+  if (!t) return { order: null };
+  try {
+    // Scan recent shipped orders for a fulfillment carrying this tracking number
+    const url = `${storeBase()}/admin/api/2024-10/orders.json?status=any&limit=250&fields=id,name,financial_status,fulfillment_status,total_price,currency,line_items,fulfillments`;
+    const r = await fetch(url, { headers: shopHeaders() });
+    if (r.status === 401 || r.status === 403) return { error: "auth" };
+    if (!r.ok) return { order: null };
+    const data = await r.json();
+    for (const order of (data.orders || [])) {
+      for (const f of (order.fulfillments || [])) {
+        const nums = [f.tracking_number, ...(f.tracking_numbers || [])].filter(Boolean).map((x) => String(x).toLowerCase());
+        if (nums.includes(t)) return { order };
+      }
+    }
+  } catch (e) {}
+  return { order: null };
+}
+
 async function findOrderByContact(email, phone) {
   // Needs read_customers scope. Searches customer by email/phone, returns latest order.
   const parts = [];
@@ -429,15 +449,21 @@ async function findOrderByContact(email, phone) {
   } catch (e) { return { order: null }; }
 }
 
-async function lookupOrder({ orderId, phone, email }) {
+async function lookupOrder({ orderId, phone, email, tracking }) {
   if (!process.env.SHOPIFY_STORE || !process.env.SHOPIFY_ADMIN_TOKEN) return { ok: false, reason: "error" };
-  if (!orderId && !phone && !email) return { ok: false, reason: "need_any" };
+  if (!orderId && !phone && !email && !tracking) return { ok: false, reason: "need_any" };
 
   let order = null;
   if (orderId) {
     const found = await findOrderByNumber(orderId);
     if (found.error === "auth") return { ok: false, reason: "auth" };
     order = found.order;
+  }
+  if (!order && tracking) {
+    const found = await findOrderByTracking(tracking);
+    if (found.error === "auth") return { ok: false, reason: "auth" };
+    order = found.order;
+    if (!order) return { ok: false, reason: "tracking_not_found" };
   }
   if (!order && (email || phone)) {
     const r = await findOrderByContact(email, phone);
@@ -570,6 +596,7 @@ export default async function handler(req, res) {
         auth: "Order tracking isn't authorized yet. Please message us on WhatsApp and we'll check for you.",
         no_scope: "Order tracking isn't switched on yet. Please message us on WhatsApp and we'll check for you.",
         no_customer_scope: "Searching by phone/email isn't enabled. Please enter your order number instead.",
+        tracking_not_found: "I couldn't match that tracking number to an order. Please enter your Order number (e.g. #TRZ1234) instead, or message us on WhatsApp.",
         need_any: "Please enter your order number, phone, or email.",
         not_found: "I couldn't find an order with those details. Please double-check and try again.",
         error: "I couldn't check the order right now. Please try again shortly.",
@@ -640,18 +667,12 @@ export default async function handler(req, res) {
         const catalog = await getCatalog();
         const rawQ = lastMsg;                                 // exactly what the customer typed
         const normQ = intentData.search_query || lastMsg;     // light typo help
-        // 1) Collection lookup first — makes category chips (Hair Care, Skin Care, Lip Care,
-        //    Personal Care Electronics) return that whole collection, since those words
-        //    aren't in product titles.
-        results = await categorySearch(rawQ);
-        // 2) Otherwise Shopify's own search engine (suggest.json)
-        if (!results || !results.length) {
-          results = await shopifySuggest(rawQ, catalog);
-          if (!results || !results.length) results = await shopifySuggest(normQ, catalog);
-          // specific product query -> narrow to the accurate one; broad query -> keep many
-          if (results && results.length) results = trimBySpecificity(rawQ, results);
-        }
-        // 3) Broad browse ("all products", "everything", "cosmetics") -> sample of the catalog
+        // Shopify's own search engine (suggest.json) — finds the exact product the customer named
+        results = await shopifySuggest(rawQ, catalog);
+        if (!results || !results.length) results = await shopifySuggest(normQ, catalog);
+        // specific product query -> narrow to the accurate one; broad query -> keep many
+        if (results && results.length) results = trimBySpecificity(rawQ, results);
+        // Broad browse ("all products", "everything", "cosmetics") -> sample of the catalog
         if ((!results || !results.length) && /\b(all|every|everything|sab|saray|sary|cosmetic|cosmetics|makeup|products?|items?)\b/.test(q)) {
           results = catalog.filter((p) => p.available).slice(0, 12);
         }
