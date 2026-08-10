@@ -594,6 +594,11 @@ export default async function handler(req, res) {
     }
 
     const intentData = await detectIntent(messages);
+    // Safety net: clear browse/product phrases should always search products
+    if (intentData.intent === "other" &&
+        /\b(product|products|cosmetic|cosmetics|makeup|lipstick|foundation|serum|cream|skin ?care|hair ?care|lip ?care|show|dikhao|chahiye|chahie|all products|everything)\b/i.test(lastMsg)) {
+      intentData.intent = "product";
+    }
     let products = [];
     let action = "none";
     let showCall = false;
@@ -601,44 +606,29 @@ export default async function handler(req, res) {
 
     if (intentData.intent === "product") {
       const q = ((intentData.search_query || "") + " " + lastMsg).toLowerCase();
-      const packPhrase = packOnly(lastMsg);   // only for generic pack browse; null if specific product
       let results;
-      if (packPhrase && packPhrase.startsWith("pack of")) {
-        const catalog = await getCatalog();
-        results = packSearch(catalog, packPhrase);              // ONLY real packs of that size
-      } else if (/\b(discount|discounted|sale|deal|deals|offer|offers|cheap|off)\b/.test(q)) {
+      if (/\b(discount|discounted|sale|deal|deals|offer|offers|cheap|off)\b/.test(q)) {
         const catalog = await getCatalog();
         results = catalog.filter((p) => p.discountPercent > 0)
           .sort((a, b) => b.discountPercent - a.discountPercent).slice(0, 20);
       } else {
-        // 1) collections (fast) for category names like "Azadi Sale"
-        results = await categorySearch(intentData.search_query);
-        if (!results) {
-          const catalog = await getCatalog();
-          const rawQ = lastMsg;                                 // exactly what the customer typed
-          const normQ = intentData.search_query || lastMsg;     // AI-cleaned (fixes typos/synonyms)
-          // 2) Shopify's own search engine — RAW first (accurate for specific names), then cleaned
-          results = await shopifySuggest(rawQ, catalog);
-          if (!results || !results.length) results = await shopifySuggest(normQ, catalog);
-          // narrow to the accurate product when the query strongly matches one
-          if (results && results.length) results = trimBySpecificity(rawQ, results);
-          // 3) fall back to our keyword+AI search if Shopify returns nothing
-          if (!results || !results.length) {
-            const base = keywordSearch(catalog, normQ);
-            if (base.length > 4) {
-              const refined = await aiPickProducts(base, normQ);
-              results = refined && refined.length ? refined : base;
-            } else {
-              results = base;
-            }
-          }
+        const catalog = await getCatalog();
+        const rawQ = lastMsg;                                 // exactly what the customer typed
+        const normQ = intentData.search_query || lastMsg;     // light typo help
+        // Pure Shopify search engine (suggest.json) — Shopify ranks relevance itself.
+        results = await shopifySuggest(rawQ, catalog);
+        if (!results || !results.length) results = await shopifySuggest(normQ, catalog);
+        // specific product query -> narrow to the accurate one; broad query -> keep many
+        if (results && results.length) results = trimBySpecificity(rawQ, results);
+        // Broad browse ("all products", "everything", "cosmetics") -> show a sample of the catalog
+        if ((!results || !results.length) && /\b(all|every|everything|sab|saray|sary|cosmetic|cosmetics|makeup|products?|items?)\b/.test(q)) {
+          results = catalog.filter((p) => p.available).slice(0, 12);
         }
       }
-      products = results || [];
-      // Only show IN-STOCK products
-      products = products.filter((p) => p.available);
+      products = (results || []).filter((p) => p.available);
       if (products.length) {
-        context = `Found ${products.length} matching products. In ONE short line, say you found some options and ask which they'd like. Do NOT list them (the cards show below).`;
+        const list = products.slice(0, 6).map((p) => `${p.title}${p.price ? " — Rs " + p.price : ""}`).join("; ");
+        context = `Products found (name — price): ${list}. Reply in ONE short line in the customer's language. If they asked about a specific product's price, state that product's price from this list. Otherwise just say something like "Here are some options for you 👇". NEVER ask which type or what kind. NEVER say a price is unavailable — the prices are shown on the cards.`;
       } else {
         action = "agent";
         context = `No matching products. In one short line say we don't have that right now, and they can chat with our team on WhatsApp (button below) or ask for something else. Do NOT invent products.`;
