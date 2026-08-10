@@ -640,12 +640,18 @@ export default async function handler(req, res) {
         const catalog = await getCatalog();
         const rawQ = lastMsg;                                 // exactly what the customer typed
         const normQ = intentData.search_query || lastMsg;     // light typo help
-        // Pure Shopify search engine (suggest.json) — Shopify ranks relevance itself.
-        results = await shopifySuggest(rawQ, catalog);
-        if (!results || !results.length) results = await shopifySuggest(normQ, catalog);
-        // specific product query -> narrow to the accurate one; broad query -> keep many
-        if (results && results.length) results = trimBySpecificity(rawQ, results);
-        // Broad browse ("all products", "everything", "cosmetics") -> show a sample of the catalog
+        // 1) Collection lookup first — makes category chips (Hair Care, Skin Care, Lip Care,
+        //    Personal Care Electronics) return that whole collection, since those words
+        //    aren't in product titles.
+        results = await categorySearch(rawQ);
+        // 2) Otherwise Shopify's own search engine (suggest.json)
+        if (!results || !results.length) {
+          results = await shopifySuggest(rawQ, catalog);
+          if (!results || !results.length) results = await shopifySuggest(normQ, catalog);
+          // specific product query -> narrow to the accurate one; broad query -> keep many
+          if (results && results.length) results = trimBySpecificity(rawQ, results);
+        }
+        // 3) Broad browse ("all products", "everything", "cosmetics") -> sample of the catalog
         if ((!results || !results.length) && /\b(all|every|everything|sab|saray|sary|cosmetic|cosmetics|makeup|products?|items?)\b/.test(q)) {
           results = catalog.filter((p) => p.available).slice(0, 12);
         }
