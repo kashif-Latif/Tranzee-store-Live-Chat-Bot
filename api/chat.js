@@ -448,6 +448,21 @@ async function lookupOrder({ orderId, phone, email }) {
 
   const fulfilled = order.fulfillment_status === "fulfilled" || (order.fulfillments && order.fulfillments.length > 0);
   const items = (order.line_items || []).map((li) => li.title).slice(0, 5);
+
+  // Pull carrier + tracking info from the latest fulfillment that has it
+  let carrier = "", trackingNumber = "", trackingUrl = "";
+  const fs = order.fulfillments || [];
+  for (let i = fs.length - 1; i >= 0; i--) {
+    const f = fs[i];
+    const num = (f.tracking_numbers && f.tracking_numbers[0]) || f.tracking_number;
+    if (num) {
+      trackingNumber = String(num);
+      carrier = f.tracking_company || (f.tracking_companies && f.tracking_companies[0]) || "";
+      trackingUrl = (f.tracking_urls && f.tracking_urls[0]) || f.tracking_url || "";
+      break;
+    }
+  }
+
   return {
     ok: true,
     order: {
@@ -455,7 +470,12 @@ async function lookupOrder({ orderId, phone, email }) {
       financial_status: order.financial_status,
       fulfillment_status: order.fulfillment_status || "unfulfilled",
       shipped: !!fulfilled,
+      total: order.total_price || "",
+      currency: order.currency || "PKR",
       items,
+      carrier,
+      trackingNumber,
+      trackingUrl,
     },
   };
 }
@@ -533,11 +553,16 @@ export default async function handler(req, res) {
     if (body.track) {
       const r = await lookupOrder(body.track);
       if (r.ok) {
-        const itemsLine = r.order.items.length ? ` (${r.order.items.join(", ")})` : "";
-        const status = r.order.shipped ? "shipped" : (r.order.fulfillment_status || "processing");
+        const o = r.order;
+        const itemsLine = o.items.length ? ` (${o.items.join(", ")})` : "";
+        const status = o.shipped ? "shipped" : (o.fulfillment_status || "processing");
+        const totalLine = o.total ? ` Total: Rs ${o.total}.` : "";
+        const carrierLine = o.trackingNumber
+          ? ` Courier: ${o.carrier || "our courier"}, tracking #${o.trackingNumber}. Tap the button below to track.`
+          : (o.shipped ? " Tracking details will appear here once the courier scans it." : "");
         return res.status(200).json({
-          reply: `Order ${r.order.name}${itemsLine} — payment: ${r.order.financial_status}, status: ${status}.`,
-          order: r.order,
+          reply: `Order ${o.name}${itemsLine} — payment: ${o.financial_status}, status: ${status}.${totalLine}${carrierLine}`,
+          order: o,
           whatsappNumber: waNumber,
         });
       }
