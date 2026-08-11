@@ -33,8 +33,37 @@ function setCors(res) {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 
+// ---- Admin token: auto-refresh via client-credentials (Dev Dashboard apps rotate ~24h) ----
+// If SHOPIFY_CLIENT_ID + SHOPIFY_CLIENT_SECRET are set, the backend fetches a fresh token itself
+// and caches it. Otherwise it falls back to a static SHOPIFY_ADMIN_TOKEN (permanent-token apps).
+let CURRENT_TOKEN = "";
+let TOKEN_TIME = 0;
+const TOKEN_TTL = 20 * 60 * 60 * 1000; // refresh every 20h (tokens last ~24h)
+
+async function ensureToken() {
+  const cid = process.env.SHOPIFY_CLIENT_ID;
+  const secret = process.env.SHOPIFY_CLIENT_SECRET;
+  if (!cid || !secret) { CURRENT_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN || ""; return CURRENT_TOKEN; }
+  if (CURRENT_TOKEN && Date.now() - TOKEN_TIME < TOKEN_TTL) return CURRENT_TOKEN;
+  try {
+    const r = await fetch(`${storeBase()}/admin/oauth/access_token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ grant_type: "client_credentials", client_id: cid, client_secret: secret }),
+    });
+    if (r.ok) {
+      const data = await r.json();
+      if (data.access_token) { CURRENT_TOKEN = data.access_token; TOKEN_TIME = Date.now(); }
+    }
+  } catch (e) {}
+  if (!CURRENT_TOKEN) CURRENT_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN || "";
+  return CURRENT_TOKEN;
+}
+
+function hasShop() { return process.env.SHOPIFY_STORE && (CURRENT_TOKEN || process.env.SHOPIFY_ADMIN_TOKEN); }
+
 function shopHeaders() {
-  return { "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN, "Content-Type": "application/json" };
+  return { "X-Shopify-Access-Token": CURRENT_TOKEN || process.env.SHOPIFY_ADMIN_TOKEN, "Content-Type": "application/json" };
 }
 function storeBase() { return `https://${process.env.SHOPIFY_STORE}`; }
 
@@ -71,7 +100,7 @@ const TTL = 5 * 60 * 1000;
 async function getCatalog() {
   const now = Date.now();
   if (CATALOG && now - CATALOG_TIME < TTL) return CATALOG;
-  if (!process.env.SHOPIFY_STORE || !process.env.SHOPIFY_ADMIN_TOKEN) return [];
+  if (!hasShop()) return [];
   let all = [];
   let url = `${storeBase()}/admin/api/2024-10/products.json?limit=250&status=active&published_status=published`;
   try {
@@ -95,7 +124,7 @@ let COLLECTIONS = null, COLL_TIME = 0;
 async function getCollections() {
   const now = Date.now();
   if (COLLECTIONS && now - COLL_TIME < TTL) return COLLECTIONS;
-  if (!process.env.SHOPIFY_STORE || !process.env.SHOPIFY_ADMIN_TOKEN) return [];
+  if (!hasShop()) return [];
   const out = [];
   for (const type of ["custom_collections", "smart_collections"]) {
     try {
@@ -450,7 +479,7 @@ async function findOrderByContact(email, phone) {
 }
 
 async function lookupOrder({ orderId, phone, email, tracking }) {
-  if (!process.env.SHOPIFY_STORE || !process.env.SHOPIFY_ADMIN_TOKEN) return { ok: false, reason: "error" };
+  if (!hasShop()) return { ok: false, reason: "error" };
   if (!orderId && !phone && !email && !tracking) return { ok: false, reason: "need_any" };
 
   let order = null;
@@ -574,6 +603,7 @@ export default async function handler(req, res) {
 
   try {
     const body = req.body || {};
+    await ensureToken();   // make sure we have a valid (auto-refreshed) Admin token
 
     // ---- Verified order tracking from the tracking form ----
     if (body.track) {
