@@ -13,7 +13,7 @@ function providerChain() {
   const groqKey = process.env.GROQ_API_KEY;
   const geminiKey = process.env.GEMINI_API_KEY;
   if (groqKey) {
-    for (const m of (process.env.GROQ_MODELS || "llama-3.3-70b-versatile,llama-3.1-8b-instant")
+    for (const m of (process.env.GROQ_MODELS || "openai/gpt-oss-120b,llama-3.1-8b-instant")
       .split(",").map((s) => s.trim()).filter(Boolean)) {
       chain.push({ url: "https://api.groq.com/openai/v1/chat/completions", key: groqKey, model: m });
     }
@@ -407,7 +407,7 @@ From this short product list, return ONLY a JSON array of the index numbers that
 Products:
 ${list}`;
   try {
-    const raw = await groqCall([{ role: "user", content: prompt }], { temperature: 0, max_tokens: 80 });
+    const raw = await groqCall([{ role: "user", content: prompt }], { temperature: 0, max_tokens: 300 });
     const m = raw.replace(/```json/gi, "").replace(/```/g, "").trim().match(/\[[\s\S]*\]/);
     const arr = JSON.parse(m ? m[0] : "[]");
     if (!Array.isArray(arr)) return null;
@@ -536,15 +536,17 @@ async function lookupOrder({ orderId, phone, email, tracking }) {
 }
 
 async function groqCall(messages, opts) {
-  const { temperature = 0.5, max_tokens = 200 } = opts || {};
+  const { temperature = 0.5, max_tokens = 512 } = opts || {};
   const chain = providerChain();
   let lastErr = "";
   for (const p of chain) {
     try {
+      const payload = { model: p.model, messages, temperature, max_tokens };
+      if (/gpt-oss/i.test(p.model)) payload.reasoning_effort = "low";
       const r = await fetch(p.url, {
         method: "POST",
         headers: { Authorization: `Bearer ${p.key}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ model: p.model, messages, temperature, max_tokens }),
+        body: JSON.stringify(payload),
       });
       if (r.status === 429) { lastErr = "429 rate limit"; continue; }   // busy -> next provider/model
       if (r.status === 401 || r.status === 403) { lastErr = "auth"; continue; } // bad key -> next provider
@@ -561,10 +563,11 @@ async function groqCall(messages, opts) {
 }
 
 async function detectIntent(messages) {
-  const convo = messages.slice(-6).map((m) => `${m.role}: ${m.content}`).join("\n");
+  const lastUser = ([...messages].reverse().find((m) => m.role === "user") || {}).content || "";
+  const convo = messages.slice(-2).map((m) => `${m.role}: ${m.content}`).join("\n");
   const NOUNS = "lipstick, lip gloss, lip liner, foundation, concealer, primer, powder, compact, blush, highlighter, kajal, eyeliner, mascara, eyeshadow, serum, moisturizer, cream, sunblock, sunscreen, spf, face wash, cleanser, toner, face mask, scrub, perfume, fragrance, body spray, shampoo, conditioner, hair oil, beauty device, massager, facial roller, makeup brush";
   const prompt = `You are the intent classifier + search normalizer for Trenzee Cosmetics, a beauty & cosmetics store in Pakistan.
-Classify the LAST customer message. Return ONLY JSON, no markdown:
+Classify the LAST customer message (shown as CURRENT below). Build search_query ONLY from the CURRENT message — ignore products or topics from earlier turns. Return ONLY JSON, no markdown:
 {"intent":"product|order_status|talk_to_agent|place_order|greeting|other","search_query":""}
 
 For "product" intent, build search_query using the store's product words below. IMPORTANT:
@@ -583,14 +586,51 @@ Intents:
 - "greeting": hi/hello/salaam/thanks only.
 - "other": unclear/gibberish (e.g. "ss") or general question with no product. Never guess a product here.
 
-Conversation:
-${convo}`;
+Recent context:
+${convo}
+
+CURRENT message (classify + build search_query from THIS only): "${lastUser}"`;
   try {
-    const raw = await groqCall([{ role: "user", content: prompt }], { temperature: 0, max_tokens: 120 });
+    const raw = await groqCall([{ role: "user", content: prompt }], { temperature: 0, max_tokens: 400 });
     const clean = raw.replace(/```json/gi, "").replace(/```/g, "").trim();
     const p = JSON.parse(clean);
     return { intent: p.intent || "other", search_query: p.search_query || "" };
   } catch (e) { return { intent: "other", search_query: "" }; }
+}
+
+
+// ---- Chat logging to a Google Apps Script Web App (unlimited, free) ----
+// Put your Apps Script /exec URL in LOG_WEBHOOK_URL.
+// KEY FIX: send as text/plain (NOT application/json) so the browser/server skips the CORS
+// preflight that Apps Script cannot answer. The script still JSON.parses e.postData.contents.
+// We AWAIT so the serverless function isn't frozen before the write finishes.
+async function logChat(fields) {
+  const url = process.env.LOG_WEBHOOK_URL;
+  if (!url) return;
+  try {
+    const payload = {
+      store: fields.store || "",
+      session: fields.session || "",
+      message: fields.message || "",
+      reply: fields.reply || "",
+      intent: fields.intent || "",
+      products: fields.products || "",
+      action: fields.action || "",
+      ua: fields.ua || "",
+    };
+    // Log write capped at 500ms: reliable, but can NEVER delay the reply by more than half a second.
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 500);
+    await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },  // text/plain = no CORS preflight
+      body: JSON.stringify(payload),
+      redirect: "follow",
+      keepalive: true,
+      signal: ctrl.signal,
+    }).catch(() => {});   // ignore logging errors/timeouts
+    clearTimeout(timer);
+  } catch (e) {}
 }
 
 export default async function handler(req, res) {
@@ -734,6 +774,15 @@ export default async function handler(req, res) {
     const fallback = products.length
       ? "Here are some options for you 👇"
       : (action === "agent" ? "You can chat with our team on WhatsApp using the button below." : "How can I help you find the perfect beauty product?");
+    // Log first (capped at 500ms so the reply is never delayed more than half a second),
+    // then send the reply — reliable logging, still fast.
+    await logChat({
+      store: "Trixi Bot", session: body.session || "",
+      message: lastMsg, reply: reply || fallback,
+      intent: intentData.intent,
+      products: products.slice(0, 5).map((p) => p.title).join(" | "),
+      action, ua: (req.headers && req.headers["user-agent"]) || "",
+    });
 
     return res.status(200).json({
       reply: reply || fallback,
@@ -765,7 +814,7 @@ async function shortReply(messages, context) {
         { role: "system", content: `Context: ${context}` },
         ...messages.slice(-6).map((m) => ({ role: m.role, content: m.content })),
       ],
-      { temperature: 0.5, max_tokens: 90 }
+      { temperature: 0.5, max_tokens: 400 }
     );
   } catch (e) { return ""; }
 }
