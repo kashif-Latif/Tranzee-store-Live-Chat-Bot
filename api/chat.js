@@ -278,7 +278,7 @@ async function categorySearch(query) {
 function trimBySpecificity(query, results) {
   if (!results || !results.length) return results || [];
   const n = keywords(query).length;   // number of meaningful words the customer typed
-  if (n >= 6) return results.slice(0, 1);    // full product-name paste -> the one accurate product
+  if (n >= 6) return results.slice(0, 3);    // full product-name paste -> top match(es), not just one
   if (n === 5) return results.slice(0, 4);   // fairly specific -> a few
   return results.slice(0, 10);               // short/browse query ("lipstick", "boys pants") -> more
 }
@@ -604,15 +604,49 @@ CURRENT message (classify + build search_query from THIS only): "${lastUser}"`;
 // KEY FIX: send as text/plain (NOT application/json) so the browser/server skips the CORS
 // preflight that Apps Script cannot answer. The script still JSON.parses e.postData.contents.
 // We AWAIT so the serverless function isn't frozen before the write finishes.
+// ---- Security layer: PII redaction, input sanitization, rate limiting ----
+function redactPII(text) {
+  if (!text) return "";
+  let t = String(text);
+  t = t.replace(/[\w.+-]+@[\w-]+\.[\w.-]+/g, "[email]");
+  t = t.replace(/\b\d{5}-\d{7}-\d\b/g, "[cnic]");
+  t = t.replace(/(?:\+?92|0)?[\s-]?3\d{2}[\s-]?\d{7}\b/g, "[phone]");
+  t = t.replace(/\b\d{11,}\b/g, "[number]");
+  return t;
+}
+function sanitizeInput(text) {
+  if (!text) return "";
+  let t = String(text);
+  t = t.replace(/[\u200B-\u200F\u202A-\u202E\u2060\uFEFF]/g, "");
+  t = t.replace(/ignore (all|previous|the above)[^.]*/gi, "");
+  t = t.replace(/disregard (all|previous|the above)[^.]*/gi, "");
+  t = t.replace(/you are now[^.]*/gi, "");
+  t = t.replace(/system prompt|developer message|reveal your (rules|prompt|instructions)/gi, "");
+  return t.slice(0, 500);
+}
+const RL = new Map();
+const RL_MAX = 20;
+const RL_WINDOW = 60 * 1000;
+function rateLimited(key) {
+  if (!key) return false;
+  const now = Date.now();
+  const rec = RL.get(key) || { n: 0, t: now };
+  if (now - rec.t > RL_WINDOW) { rec.n = 0; rec.t = now; }
+  rec.n++;
+  RL.set(key, rec);
+  return rec.n > RL_MAX;
+}
+
 async function logChat(fields) {
+
   const url = process.env.LOG_WEBHOOK_URL;
   if (!url) return;
   try {
     const payload = {
       store: fields.store || "",
       session: fields.session || "",
-      message: fields.message || "",
-      reply: fields.reply || "",
+      message: redactPII(fields.message || ""),
+      reply: redactPII(fields.reply || ""),
       intent: fields.intent || "",
       products: fields.products || "",
       action: fields.action || "",
@@ -644,6 +678,11 @@ export default async function handler(req, res) {
   try {
     const body = req.body || {};
     await ensureToken();   // make sure we have a valid (auto-refreshed) Admin token
+
+    const rlKey = (body.session || "") + "|" + ((req.headers && (req.headers["x-forwarded-for"] || req.headers["x-real-ip"])) || "");
+    if (rateLimited(rlKey)) {
+      return res.status(200).json({ reply: "You're sending messages very fast — please wait a moment and try again 🙂", products: [], action: "none", whatsappNumber: waNumber });
+    }
 
     // ---- Verified order tracking from the tracking form ----
     if (body.track) {
@@ -678,6 +717,10 @@ export default async function handler(req, res) {
     const { messages } = body;
     if (!Array.isArray(messages) || messages.length === 0) {
       return res.status(400).json({ error: "messages array required" });
+    }
+
+    for (const m of messages) {
+      if (m && m.role === "user" && typeof m.content === "string") m.content = sanitizeInput(m.content);
     }
 
     const lastMsg = ([...messages].reverse().find((m) => m.role === "user") || {}).content || "";
@@ -740,6 +783,16 @@ export default async function handler(req, res) {
         // Shopify's own search engine (suggest.json) — finds the exact product the customer named
         results = await shopifySuggest(rawQ, catalog);
         if (!results || !results.length) results = await shopifySuggest(normQ, catalog);
+        // Long pasted product titles often return nothing from suggest.json (too many terms).
+        // Retry with the most distinctive words, then with our own keyword search.
+        if (!results || !results.length) {
+          const kws = keywords(rawQ);
+          if (kws.length > 4) {
+            results = await shopifySuggest(kws.slice(0, 4).join(" "), catalog);
+            if (!results || !results.length) results = await shopifySuggest(kws.slice(0, 2).join(" "), catalog);
+          }
+        }
+        if (!results || !results.length) results = keywordSearch(catalog, rawQ);
         // specific product query -> narrow to the accurate one; broad query -> keep many
         if (results && results.length) results = trimBySpecificity(rawQ, results);
         // Broad browse ("all products", "everything", "cosmetics") -> sample of the catalog
